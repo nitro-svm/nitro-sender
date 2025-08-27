@@ -1061,6 +1061,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "five8"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a75b8549488b4715defcb0d8a8a1c1c76a80661b5fa106b4ca0e7fce59d7d875"
+dependencies = [
+ "five8_core",
+]
+
+[[package]]
 name = "five8_const"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,7 +1914,7 @@ dependencies = [
  "solana-pubkey",
  "solana-rpc-client",
  "solana-rpc-client-api",
- "solana-signature",
+ "solana-signature 3.1.0",
  "solana-signer",
  "solana-transaction",
  "solana-transaction-error",
@@ -3226,7 +3235,7 @@ dependencies = [
  "blake3",
  "solana-define-syscall",
  "solana-hash",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
 ]
 
 [[package]]
@@ -3272,7 +3281,7 @@ dependencies = [
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-rpc-client-nonce-utils",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-streamer",
  "solana-thin-client",
@@ -3299,7 +3308,7 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-pubkey",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-system-interface",
  "solana-transaction",
@@ -3591,7 +3600,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "solana-atomic-u64",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "wasm-bindgen",
 ]
 
@@ -3640,7 +3649,7 @@ dependencies = [
  "solana-instruction",
  "solana-program-error",
  "solana-pubkey",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sdk-ids",
  "solana-serialize-utils",
  "solana-sysvar-id",
@@ -3655,7 +3664,7 @@ dependencies = [
  "sha3",
  "solana-define-syscall",
  "solana-hash",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
 ]
 
 [[package]]
@@ -3669,7 +3678,7 @@ dependencies = [
  "rand 0.7.3",
  "solana-pubkey",
  "solana-seed-phrase",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "wasm-bindgen",
 ]
@@ -3761,7 +3770,7 @@ dependencies = [
  "solana-hash",
  "solana-instruction",
  "solana-pubkey",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sdk-ids",
  "solana-short-vec",
  "solana-system-interface",
@@ -3880,7 +3889,7 @@ dependencies = [
  "solana-rayon-threadlimit",
  "solana-sdk-ids",
  "solana-short-vec",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-time-utils",
 ]
 
@@ -3971,7 +3980,7 @@ dependencies = [
  "solana-program-pack",
  "solana-pubkey",
  "solana-rent",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sdk-ids",
  "solana-sdk-macro",
  "solana-secp256k1-recover",
@@ -4105,7 +4114,7 @@ dependencies = [
  "solana-atomic-u64",
  "solana-decode-error",
  "solana-define-syscall",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sha256-hasher",
  "wasm-bindgen",
 ]
@@ -4128,7 +4137,7 @@ dependencies = [
  "solana-clock",
  "solana-pubkey",
  "solana-rpc-client-api",
- "solana-signature",
+ "solana-signature 2.2.1",
  "thiserror 2.0.16",
  "tokio",
  "tokio-stream",
@@ -4252,7 +4261,7 @@ dependencies = [
  "solana-message",
  "solana-pubkey",
  "solana-rpc-client-api",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-transaction",
  "solana-transaction-error",
  "solana-transaction-status-client-types",
@@ -4313,6 +4322,12 @@ name = "solana-sanitize"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61f1bc1357b8188d9c4a3af3fc55276e56987265eb7ad073ae6f8180ee54cecf"
+
+[[package]]
+name = "solana-sanitize"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "927e833259588ac8f860861db0f6e2668c3cc46d917798ade116858960acfe8a"
 
 [[package]]
 name = "solana-sbpf"
@@ -4447,7 +4462,7 @@ checksum = "817a284b63197d2b27afdba829c5ab34231da4a9b4e763466a003c40ca4f535e"
 dependencies = [
  "solana-instruction",
  "solana-pubkey",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
 ]
 
 [[package]]
@@ -4481,7 +4496,17 @@ dependencies = [
  "serde",
  "serde-big-array",
  "serde_derive",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
+]
+
+[[package]]
+name = "solana-signature"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bb8057cc0e9f7b5e89883d49de6f407df655bb6f3a71d0b7baf9986a2218fd9"
+dependencies = [
+ "five8",
+ "solana-sanitize 3.0.0",
 ]
 
 [[package]]
@@ -4491,7 +4516,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c41991508a4b02f021c1342ba00bcfa098630b213726ceadc7cb032e051975b"
 dependencies = [
  "solana-pubkey",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-transaction-error",
 ]
 
@@ -4587,7 +4612,7 @@ dependencies = [
  "solana-perf",
  "solana-pubkey",
  "solana-quic-definitions",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-time-utils",
  "solana-tls-utils",
@@ -4643,7 +4668,7 @@ dependencies = [
  "solana-program-memory",
  "solana-pubkey",
  "solana-rent",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sdk-ids",
  "solana-sdk-macro",
  "solana-slot-hashes",
@@ -4684,7 +4709,7 @@ dependencies = [
  "solana-pubkey",
  "solana-rpc-client",
  "solana-rpc-client-api",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-system-interface",
  "solana-transaction",
@@ -4747,7 +4772,7 @@ dependencies = [
  "solana-quic-definitions",
  "solana-rpc-client",
  "solana-rpc-client-api",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-transaction",
  "solana-transaction-error",
@@ -4770,10 +4795,10 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-pubkey",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-sdk-ids",
  "solana-short-vec",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "solana-system-interface",
  "solana-transaction-error",
@@ -4801,7 +4826,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "solana-instruction",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
 ]
 
 [[package]]
@@ -4818,7 +4843,7 @@ dependencies = [
  "solana-packet",
  "solana-perf",
  "solana-short-vec",
- "solana-signature",
+ "solana-signature 2.2.1",
 ]
 
 [[package]]
@@ -4848,7 +4873,7 @@ dependencies = [
  "solana-reserved-account-keys",
  "solana-reward-info",
  "solana-sdk-ids",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-system-interface",
  "solana-transaction",
  "solana-transaction-error",
@@ -4878,7 +4903,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-message",
  "solana-reward-info",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-transaction",
  "solana-transaction-context",
  "solana-transaction-error",
@@ -4921,7 +4946,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "solana-feature-set",
- "solana-sanitize",
+ "solana-sanitize 2.2.1",
  "solana-serde-varint",
 ]
 
@@ -4978,7 +5003,7 @@ dependencies = [
  "solana-sdk-ids",
  "solana-seed-derivable",
  "solana-seed-phrase",
- "solana-signature",
+ "solana-signature 2.2.1",
  "solana-signer",
  "subtle",
  "thiserror 2.0.16",
