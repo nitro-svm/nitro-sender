@@ -18,7 +18,7 @@ tokio = { version = "1.47.1", features = ["full"] }
 tracing = { version = "0.1.41", default-features = false }
 
 # Solana & Agave
-solana-client = "=2.2.1"
+solana-client = "=3.0.0"
 solana-commitment-config = "=2.2.1"
 solana-epoch-info = "=2.2.1"
 solana-keypair = "=2.2.1"
