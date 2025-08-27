@@ -1,0 +1,38 @@
+[package]
+name = "nitro-sender"
+description = "A library for sending transactions to the Solana L1 quickly."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Nitro Labs <team@nitro.technology>"]
+homepage = "https://www.termina.technology"
+publish = true
+repository = "https://github.com/nitro-svm/nitro-sender"
+
+[dependencies]
+# External dependencies from crates.io
+async-trait = "0.1.89"
+itertools = "0.14.0"
+serde_json = { version = "1.0.143", default-features = false }
+tokio = { version = "1.47.1", features = ["full"] }
+tracing = { version = "0.1.41", default-features = false }
+
+# Solana & Agave
+solana-client = "=2.2.1"
+solana-commitment-config = "=2.2.1"
+solana-epoch-info = "=2.2.1"
+solana-keypair = "=2.2.1"
+solana-program = "=2.2.1"
+solana-pubkey = "=2.2.1"
+solana-rpc-client = "=2.2.1"
+solana-rpc-client-api = "=2.2.1"
+solana-signature = "=2.2.1"
+solana-signer = "=2.2.1"
+solana-transaction = "=2.2.1"
+solana-transaction-error = "=2.2.1"
+solana-transaction-status = "=2.2.1"
+
+[dev-dependencies]
+# External dependencies from crates.io
+tokio = { version = "1.47.1", features = ["test-util"] }
+tracing-subscriber = "0.3.19"
