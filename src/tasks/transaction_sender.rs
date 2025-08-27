@@ -16,10 +16,11 @@ use tokio::{
 };
 use tracing::{Instrument, Span, trace, warn};
 
-use crate::{
-    client::SEND_TRANSACTION_INTERVAL,
+use super::super::{
+    channels::upgrade_and_send,
     messages::{BlockMessage, ConfirmTransactionMessage, SendTransactionMessage},
 };
+use crate::client::SEND_TRANSACTION_INTERVAL;
 
 /// Spawns an independent task that listens for [`SendTransactionMessage`]s and periodically submits
 /// transactions using the Solana RPC client, re-signing the transactions when necessary.
@@ -35,78 +36,68 @@ pub fn spawn_transaction_sender(
     signers: Vec<Arc<Keypair>>,
     blockdata_rx: watch::Receiver<BlockMessage>,
     transaction_confirmer_tx: mpsc::UnboundedSender<ConfirmTransactionMessage>,
-    transaction_sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
+    transaction_sender_tx: mpsc::WeakUnboundedSender<SendTransactionMessage>,
     mut transaction_sender_rx: mpsc::UnboundedReceiver<SendTransactionMessage>,
-    mut shutdown_signal: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_send = Instant::now();
 
-        loop {
-            tokio::select! {
-                _ = shutdown_signal.changed() => {
-                    warn!("received shutdown signal, shutting down transaction sender");
-                    break;
+        while let Some(mut msg) = transaction_sender_rx.recv().await {
+            if msg.response_tx.is_closed() {
+                warn!("no receivers for transaction sender, shutting down transaction sender");
+                break;
+            }
+
+            // Get the current newest block data but don't wait for a new block, just use
+            // the current value.
+            let blockdata = *blockdata_rx.borrow();
+            let last_valid_block_height =
+                sign_transaction_if_necessary(&blockdata, &mut msg, &signers);
+
+            // Space the transaction submissions out by a small delay to avoid rate limits.
+            tokio::time::sleep_until(last_send + SEND_TRANSACTION_INTERVAL).await;
+            last_send = Instant::now();
+
+            let res = send_transaction(&rpc_client, &msg.transaction)
+                .instrument(msg.span.clone())
+                .await;
+
+            match res {
+                Ok(_) => {
+                    trace!(
+                        "[{}] successfully submitted tx {} to RPC",
+                        msg.index,
+                        msg.transaction.get_signature()
+                    );
+                    let _ = transaction_confirmer_tx.send(ConfirmTransactionMessage {
+                        span: msg.span,
+                        index: msg.index,
+                        transaction: msg.transaction,
+                        last_valid_block_height,
+                        response_tx: msg.response_tx,
+                    });
                 }
-                _ = transaction_sender_tx.closed() => {
-                    warn!("no senders for transaction sender, shutting down transaction sender");
-                    break;
-                }
-                Some(mut msg) = transaction_sender_rx.recv() => {
-                    if msg.response_tx.is_closed() {
-                        warn!("no receivers for transaction sender, shutting down transaction sender");
+                Err(e) => {
+                    let _enter = msg.span.clone().entered();
+                    warn!(
+                        "failed to send transaction [{}] (batch index: {}, target slot: {}, current block: {}): {e:?}",
+                        msg.transaction.get_signature(),
+                        msg.index,
+                        last_valid_block_height,
+                        blockdata.block_height
+                    );
+
+                    let res = upgrade_and_send(
+                        &transaction_sender_tx,
+                        [SendTransactionMessage {
+                            // Force re-sign. Since the transaction couldn't be sent, this should be safe.
+                            last_valid_block_height: 0,
+                            ..msg
+                        }],
+                    );
+
+                    if res.is_break() {
                         break;
-                    }
-                    // Get the current newest block data but don't wait for a new block, just use
-                    // the current value.
-                    let blockdata = *blockdata_rx.borrow();
-                    let last_valid_block_height =
-                        sign_transaction_if_necessary(&blockdata, &mut msg, &signers);
-
-                    // Space the transaction submissions out by a small delay to avoid rate limits.
-                    tokio::time::sleep_until(last_send + SEND_TRANSACTION_INTERVAL).await;
-                    last_send = Instant::now();
-
-                    let res = send_transaction(&rpc_client, &msg.transaction)
-                        .instrument(msg.span.clone())
-                        .await;
-
-                    match res {
-                        Ok(_) => {
-                            trace!(
-                                "[{}] successfully submitted tx {} to RPC",
-                                msg.index,
-                                msg.transaction.get_signature()
-                            );
-                            if let Err(e) = transaction_confirmer_tx.send(ConfirmTransactionMessage {
-                                span: msg.span,
-                                index: msg.index,
-                                transaction: msg.transaction,
-                                last_valid_block_height,
-                                response_tx: msg.response_tx,
-                            }) {
-                                warn!("failed to queue transaction for confirmation: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            let _enter = msg.span.clone().entered();
-                            warn!(
-                                "failed to send transaction [{}] (batch index: {}, target slot: {}, current block: {}): {e:?}",
-                                msg.transaction.get_signature(),
-                                msg.index,
-                                last_valid_block_height,
-                                blockdata.block_height
-                            );
-
-                            if let Err(e) = transaction_sender_tx.send(SendTransactionMessage {
-                                // Force re-sign. Since the transaction couldn't be sent, this should be safe.
-                                last_valid_block_height: 0,
-                                ..msg
-                            }) {
-                                warn!("failed to re-queue transaction for sending: {e}");
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -222,15 +213,13 @@ mod tests {
         let (transaction_sender_tx, transaction_sender_rx) =
             mpsc::unbounded_channel::<SendTransactionMessage>();
 
-        let (shutdown_signal_tx, shutdown_signal_rx) = watch::channel(());
         let handle = spawn_transaction_sender(
             rpc_client,
             vec![payer.clone()],
             blockdata_rx,
             transaction_confirmer_tx,
-            transaction_sender_tx.clone(),
+            transaction_sender_tx.downgrade(),
             transaction_sender_rx,
-            shutdown_signal_rx,
         );
 
         // No transactions should be queued for confirmation yet.
@@ -305,7 +294,6 @@ mod tests {
         // Drop the transaction sender and response receiver to trigger the watcher to exit.
         drop(transaction_sender_tx);
         drop(response_rx);
-        drop(shutdown_signal_tx);
         handle.await.unwrap();
     }
 }

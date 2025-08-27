@@ -10,9 +10,10 @@ use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
-use tracing::{info, trace, warn};
+use tracing::{trace, warn};
 
 use crate::{
+    channels::upgrade_and_send,
     messages::{BlockMessage, ConfirmTransactionMessage, SendTransactionMessage, StatusMessage},
     transaction::TransactionStatus,
 };
@@ -39,32 +40,26 @@ use crate::{
 pub fn spawn_transaction_confirmer(
     rpc_client: Arc<RpcClient>,
     mut blockdata_rx: watch::Receiver<BlockMessage>,
-    transaction_sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
-    transaction_confirmer_tx: mpsc::UnboundedSender<ConfirmTransactionMessage>,
+    transaction_sender_tx: mpsc::WeakUnboundedSender<SendTransactionMessage>,
+    transaction_confirmer_tx: mpsc::WeakUnboundedSender<ConfirmTransactionMessage>,
     mut transaction_confirmer_rx: mpsc::UnboundedReceiver<ConfirmTransactionMessage>,
-    mut shutdown_signal: watch::Receiver<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::select! {
-                _ = shutdown_signal.changed() => {
-                    info!("received shutdown signal, exiting transaction confirmer");
-                    break;
-                }
-                res = transaction_confirm_loop(
+            let res = transaction_confirm_loop(
                 &mut blockdata_rx,
                 &mut transaction_confirmer_rx,
                 &rpc_client,
                 &transaction_sender_tx,
                 &transaction_confirmer_tx,
-            ) => {
+            )
+            .await;
+
             if res.is_break() {
                 warn!(
                     "no receivers for transaction confirmations, shutting down transaction confirmer"
                 );
                 break;
-            }
-                }
             }
         }
 
@@ -76,8 +71,8 @@ async fn transaction_confirm_loop(
     blockdata_rx: &mut watch::Receiver<BlockMessage>,
     transaction_confirmer_rx: &mut mpsc::UnboundedReceiver<ConfirmTransactionMessage>,
     rpc_client: &Arc<RpcClient>,
-    transaction_sender_tx: &mpsc::UnboundedSender<SendTransactionMessage>,
-    transaction_confirmer_tx: &mpsc::UnboundedSender<ConfirmTransactionMessage>,
+    transaction_sender_tx: &mpsc::WeakUnboundedSender<SendTransactionMessage>,
+    transaction_confirmer_tx: &mpsc::WeakUnboundedSender<ConfirmTransactionMessage>,
 ) -> ControlFlow<()> {
     let res = blockdata_rx.changed().await;
     if res.is_err() {
@@ -127,21 +122,8 @@ async fn transaction_confirm_loop(
         });
     }
 
-    for msg in resend {
-        if let Err(e) = transaction_sender_tx.send(msg) {
-            warn!("failed to queue transactions for re-sending: {e}");
-            // If sending fails, the receiver has been dropped and the task should exit.
-            return ControlFlow::Break(());
-        }
-    }
-
-    for msg in reconfirm {
-        if let Err(e) = transaction_confirmer_tx.send(msg) {
-            warn!("failed to re-queue transactions for confirmation: {e}");
-            // If sending fails, the receiver has been dropped and the task should exit.
-            return ControlFlow::Break(());
-        }
-    }
+    upgrade_and_send(transaction_sender_tx, resend)?;
+    upgrade_and_send(transaction_confirmer_tx, reconfirm)?;
 
     ControlFlow::Continue(())
 }
@@ -248,7 +230,7 @@ fn categorize_transaction_response(
 /// unless the transaction confirmer channel is closed.
 async fn get_transaction_statuses(
     rpc_client: &Arc<RpcClient>,
-    transaction_confirmer_tx: &mpsc::UnboundedSender<ConfirmTransactionMessage>,
+    transaction_confirmer_tx: &mpsc::WeakUnboundedSender<ConfirmTransactionMessage>,
     batch: Vec<ConfirmTransactionMessage>,
     // The use of [`ControlFlow`] here might seem superfluous at first since the function only ever
     // returns [`ControlFlow::Continue`], but [`upgrade_and_send`] *can* return [`ControlFlow::Break`]
@@ -272,13 +254,7 @@ async fn get_transaction_statuses(
         Ok(response) => response,
         Err(e) => {
             warn!("failed to get signatures: {e:?}");
-            for msg in &batch {
-                if let Err(e) = transaction_confirmer_tx.send(msg.clone()) {
-                    warn!("failed to re-queue transaction for confirmation: {e}");
-                    // If sending fails, the receiver has been dropped and the task should exit.
-                    return ControlFlow::Break(());
-                }
-            }
+            upgrade_and_send(transaction_confirmer_tx, batch)?;
             // The transactions were re-queued, keep the loop going.
             return ControlFlow::Continue(None);
         }
@@ -544,7 +520,7 @@ mod tests {
             &[&payer],
             Hash::default(),
         );
-        let confirmer_tx = transaction_confirmer_tx.clone();
+        let confirmer_tx = transaction_confirmer_tx.downgrade();
         let ControlFlow::Continue(Some(messages)) = get_transaction_statuses(
             &rpc_client,
             &confirmer_tx,
@@ -607,7 +583,7 @@ mod tests {
         );
         let ControlFlow::Continue(None) = get_transaction_statuses(
             &rpc_client,
-            &transaction_confirmer_tx.clone(),
+            &transaction_confirmer_tx.downgrade(),
             vec![
                 ConfirmTransactionMessage {
                     span: Span::current(),
@@ -726,14 +702,12 @@ mod tests {
         let (transaction_sender_tx, mut transaction_sender_rx) =
             mpsc::unbounded_channel::<SendTransactionMessage>();
 
-        let (_shutdown_signal_tx, shutdown_signal_rx) = watch::channel(());
         let handle = spawn_transaction_confirmer(
             rpc_client,
             blockdata_rx,
-            transaction_sender_tx.clone(),
-            transaction_confirmer_tx.clone(),
+            transaction_sender_tx.downgrade(),
+            transaction_confirmer_tx.downgrade(),
             transaction_confirmer_rx,
-            shutdown_signal_rx,
         );
 
         // No requests should be sent yet.

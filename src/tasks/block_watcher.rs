@@ -3,33 +3,9 @@ use std::sync::Arc;
 use solana_program::clock::DEFAULT_MS_PER_SLOT;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use tokio::{sync::watch, task::JoinHandle, time::Duration};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::messages::BlockMessage;
-
-async fn get_block_info(client: &RpcClient) -> Option<BlockMessage> {
-    let (blockhash, last_valid_block_height) = client
-        .get_latest_blockhash_with_commitment(client.commitment())
-        .await
-        .inspect_err(|e| {
-            warn!("failed to get latest blockhash: {e}");
-        })
-        .ok()?;
-
-    let epoch_info = client
-        .get_epoch_info_with_commitment(client.commitment())
-        .await
-        .inspect_err(|e| {
-            warn!("failed to get epoch info: {e}");
-        })
-        .ok()?;
-
-    Some(BlockMessage {
-        blockhash,
-        last_valid_block_height,
-        block_height: epoch_info.block_height,
-    })
-}
 
 /// Spawns an independent task that periodically checks the latest blockhash and epoch info using
 /// the Solana RPC client, and broadcasts it as a [`BlockMessage`] on the given channel.
@@ -39,45 +15,48 @@ async fn get_block_info(client: &RpcClient) -> Option<BlockMessage> {
 /// [transaction sender](`super::transaction_sender::spawn_transaction_sender`) tasks have both exited.
 pub fn spawn_block_watcher(
     blockdata_tx: watch::Sender<BlockMessage>,
-    shutdown_signal: watch::Receiver<()>,
     rpc_client: Arc<RpcClient>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // This will never equal the new slot, so the first update is always broadcast.
         let mut last_update = BlockMessage::default();
-        let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_MS_PER_SLOT));
-        let mut shutdown_signal = shutdown_signal;
-
         loop {
-            tokio::select! {
-                _ = shutdown_signal.changed() => {
-                    // If we received a shutdown signal, exit the loop.
-                    info!("received shutdown signal, exiting block watcher");
-                    break;
-                }
-                _ = blockdata_tx.closed() => {
-                    // If the channel is closed, exit the loop.
-                    break;
-                }
-                _ = ticker.tick() => {
-                    let Some(new_update) = get_block_info(&rpc_client).await else {
-                        // If we failed to get the block info, just try again on the next tick.
-                        continue;
-                    };
-
-                    if new_update == last_update {
-                        continue;
-                    }
-
-                    last_update = new_update;
-                    if let Err(e) = blockdata_tx.send(new_update) {
-                        warn!("failed to send block update: {e}");
-                        break;
-                    }
-                }
+            tokio::time::sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT)).await;
+            let Ok((blockhash, last_valid_block_height)) = rpc_client
+                .get_latest_blockhash_with_commitment(rpc_client.commitment())
+                .await
+            else {
+                warn!("failed to get latest blockhash");
+                continue;
             };
-        }
 
+            let Ok(epoch_info) = rpc_client
+                .get_epoch_info_with_commitment(rpc_client.commitment())
+                .await
+            else {
+                warn!("failed to get epoch info");
+                continue;
+            };
+
+            let block_height = epoch_info.block_height;
+            let new_update = BlockMessage {
+                blockhash,
+                last_valid_block_height,
+                block_height,
+            };
+
+            if new_update != last_update {
+                last_update = new_update;
+                if blockdata_tx.send(new_update).is_err() {
+                    warn!("no receivers for block updates, shutting down block watcher");
+                    break;
+                }
+            } else if blockdata_tx.is_closed() {
+                // Additionally check if the channel is closed even if the new update is unchanged,
+                // mostly to prevent getting stuck in tests.
+                break;
+            }
+        }
         warn!("shutting down block watcher");
     })
 }
@@ -129,23 +108,15 @@ mod tests {
             },
             RpcClientConfig::default(),
         ));
-        let (_shutdown_tx, shutdown_rx) = watch::channel(());
-        let handle = spawn_block_watcher(tx, shutdown_rx, client);
+        let handle = spawn_block_watcher(tx, client);
 
         // Checking the value straight away should return the initial value.
         assert_eq!(*rx.borrow_and_update(), initial_value);
 
-        // Checking the value half a slot later should give a new value.
+        // Checking the value half a slot later should give the same value.
         tokio::time::sleep_until(initial_time + Duration::from_millis(DEFAULT_MS_PER_SLOT / 2))
             .await;
-        assert_eq!(
-            *rx.borrow_and_update(),
-            BlockMessage {
-                blockhash: Hash::default(),
-                last_valid_block_height: 150,
-                block_height: 0
-            }
-        );
+        assert_eq!(*rx.borrow_and_update(), initial_value);
 
         // Checking the value one slot later (and a bit) should give a new value.
         tokio::time::sleep_until(initial_time + Duration::from_millis(DEFAULT_MS_PER_SLOT + 1))

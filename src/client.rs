@@ -26,7 +26,7 @@ pub const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A client that wraps an [`RpcClient`] and uses it to submit batches of transactions.
 pub struct NitroSender {
-    transaction_sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
+    transaction_sender_tx: Arc<mpsc::UnboundedSender<SendTransactionMessage>>,
 }
 
 // Clone can't be derived because of the phantom references to the TPU implementation details.
@@ -43,7 +43,6 @@ impl NitroSender {
     /// tasks will run until the [`BatchClient`] is dropped.
     pub async fn new(
         rpc_client: Arc<RpcClient>,
-        shutdown_signal_rx: tokio::sync::watch::Receiver<()>,
         signers: Vec<Arc<Keypair>>,
     ) -> Result<Self, Error> {
         let Channels {
@@ -55,17 +54,16 @@ impl NitroSender {
             transaction_sender_rx,
         } = Channels::new();
 
-        spawn_block_watcher(blockdata_tx, shutdown_signal_rx.clone(), rpc_client.clone());
+        spawn_block_watcher(blockdata_tx, rpc_client.clone());
         // Wait for the first update so the default value is never visible.
         let _ = blockdata_rx.changed().await;
 
         spawn_transaction_confirmer(
             rpc_client.clone(),
             blockdata_rx.clone(),
-            transaction_sender_tx.clone(),
-            transaction_confirmer_tx.clone(),
+            transaction_sender_tx.downgrade(),
+            transaction_confirmer_tx.downgrade(),
             transaction_confirmer_rx,
-            shutdown_signal_rx.clone(),
         );
 
         spawn_transaction_sender(
@@ -73,9 +71,8 @@ impl NitroSender {
             signers.clone(),
             blockdata_rx.clone(),
             transaction_confirmer_tx.clone(),
-            transaction_sender_tx.clone(),
+            transaction_sender_tx.downgrade(),
             transaction_sender_rx,
-            shutdown_signal_rx,
         );
 
         Ok(Self {
