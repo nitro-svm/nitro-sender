@@ -1,9 +1,12 @@
-use solana_client::client_error::ClientError;
 use solana_commitment_config::CommitmentConfig;
 use solana_program::clock::Slot;
 use solana_signature::Signature;
 use solana_transaction_error::TransactionError;
-use solana_transaction_status::TransactionStatus as SolanaTransactionStatus;
+use solana_transaction_status::{
+    TransactionConfirmationStatus, TransactionStatus as SolanaTransactionStatus,
+};
+
+use crate::client::NitroSenderError;
 
 /// The final outcome of a transaction after the [`BatchClient`] is done, either successfully
 /// or due to reaching the timeout.
@@ -11,8 +14,10 @@ use solana_transaction_status::TransactionStatus as SolanaTransactionStatus;
 pub enum TransactionOutcome<T> {
     /// The transaction was successfully confirmed by the network at the desired commitment level.
     Success(Box<SuccessfulTransaction<T>>),
-    /// Either the transaction was not submitted to the network, or it was submitted but not confirmed.
-    Unknown(UnknownTransaction<T>),
+    /// The transaction was not submitted to the network.
+    Unsubmitted(UnsubmittedTransaction<T>),
+    /// The transaction is currently being processed by the network.
+    InFlight(InFlightTransaction<T>),
     /// The transaction latest status contained an error.
     Failure(Box<FailedTransaction<T>>),
 }
@@ -25,26 +30,45 @@ pub struct SuccessfulTransaction<T> {
     pub signature: Signature,
 }
 
-/// A transaction that either was not submitted to the network, or it was submitted but not confirmed.
+/// A transaction that was not submitted to the network.
 #[derive(Debug)]
-pub struct UnknownTransaction<T> {
+pub struct UnsubmittedTransaction<T> {
     pub data: T,
+    pub slot: Option<Slot>,
+}
+
+/// A transaction that is currently being processed by the network.
+#[derive(Debug)]
+pub struct InFlightTransaction<T> {
+    pub data: T,
+    pub slot: Slot,
+    pub status: TransactionConfirmationStatus,
 }
 
 /// A transaction that resulted in an error.
 #[derive(Debug)]
 pub struct FailedTransaction<T> {
     pub data: T,
-    pub error: ClientError,
+    pub slot: Slot,
+    pub error: String,
     pub logs: Vec<String>,
 }
 
 impl<T> TransactionOutcome<T> {
     /// Returns `true` if the outcome was successful.
-    pub fn successful(&self) -> bool {
+    pub fn successful(&self, commitment: CommitmentConfig) -> bool {
         match self {
             TransactionOutcome::Success(_) => true,
-            TransactionOutcome::Unknown(_) | TransactionOutcome::Failure(_) => false,
+            TransactionOutcome::InFlight(in_flight) => {
+                if commitment.is_finalized() {
+                    TransactionConfirmationStatus::Finalized == in_flight.status
+                } else if commitment.is_confirmed() {
+                    TransactionConfirmationStatus::Processed != in_flight.status
+                } else {
+                    true
+                }
+            }
+            _ => false,
         }
     }
 
@@ -52,16 +76,15 @@ impl<T> TransactionOutcome<T> {
     pub fn into_successful(self) -> Option<Box<SuccessfulTransaction<T>>> {
         match self {
             TransactionOutcome::Success(s) => Some(s),
-            TransactionOutcome::Unknown(_) | TransactionOutcome::Failure(_) => None,
+            _ => None,
         }
     }
 
     /// Returns a reference to the inner [`FailedTransaction`] if the outcome was a failure, or [`None`] otherwise.
     pub fn error(&self) -> Option<&FailedTransaction<T>> {
         match self {
-            TransactionOutcome::Success(_) => None,
-            TransactionOutcome::Unknown(_) => None,
             TransactionOutcome::Failure(f) => Some(f),
+            _ => None,
         }
     }
 }
@@ -83,31 +106,30 @@ impl<T> TransactionProgress<T> {
     }
 }
 
-/// Describes the current status of a transaction, whether it has been submitted or not.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The current state of a transaction.
+#[derive(Debug, PartialEq, Eq)]
 pub enum TransactionStatus {
     Pending,
-    Processing,
-    Committed,
-    Failed(TransactionError, Vec<String>),
+    Processing(TransactionConfirmationStatus, Slot),
+    Committed(Slot),
+    Failed(NitroSenderError, Vec<String>, Slot),
 }
 
 impl TransactionStatus {
     /// Translates from a [`SolanaTransactionStatus`] and a [commitment level](`CommitmentConfig`)
     /// to a [`TransactionStatus`].
-    pub fn from_solana_status(
-        status: SolanaTransactionStatus,
-        logs: Vec<String>,
-        commitment: CommitmentConfig,
-    ) -> Self {
+    pub fn from_solana_status(status: SolanaTransactionStatus, logs: Vec<String>) -> Self {
         if let Some(TransactionError::AlreadyProcessed) = status.err {
-            TransactionStatus::Committed
+            Self::Committed(status.slot)
         } else if let Some(err) = status.err {
-            TransactionStatus::Failed(err, logs)
-        } else if status.satisfies_commitment(commitment) {
-            TransactionStatus::Committed
+            Self::Failed(err.into(), logs, status.slot)
         } else {
-            TransactionStatus::Processing
+            Self::Processing(
+                status
+                    .confirmation_status
+                    .unwrap_or(TransactionConfirmationStatus::Processed),
+                status.slot,
+            )
         }
     }
 
@@ -120,12 +142,53 @@ impl TransactionStatus {
     /// These should *not* be re-confirmed:
     /// - [`TransactionStatus::Committed`]
     /// - [`TransactionStatus::Failed`]
-    pub fn should_be_reconfirmed(&self) -> bool {
+    pub fn should_be_reconfirmed(&self, commitment: CommitmentConfig) -> bool {
         match self {
             TransactionStatus::Pending => true,
-            TransactionStatus::Processing => true,
-            TransactionStatus::Committed => false,
-            TransactionStatus::Failed(..) => false,
+            TransactionStatus::Committed(_) | TransactionStatus::Failed(..) => false,
+            TransactionStatus::Processing(status, _) => {
+                if commitment.is_finalized() {
+                    *status != TransactionConfirmationStatus::Finalized
+                } else if commitment.is_confirmed() {
+                    *status == TransactionConfirmationStatus::Processed
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// Checks whether the transactions should be resent based on its status.
+    pub fn should_be_resent(&self) -> bool {
+        !matches!(
+            self.error(),
+            None | Some(NitroSenderError::Tx(TransactionError::AlreadyProcessed))
+        )
+    }
+
+    /// Returns the error if the transaction failed, or [`None`] otherwise.
+    pub fn error(&self) -> Option<&NitroSenderError> {
+        match self {
+            TransactionStatus::Failed(err, _, _) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// Returns the confirmation status if the transaction is being processed, or [`None`] otherwise.
+    pub fn confirmation_status(&self) -> Option<TransactionConfirmationStatus> {
+        match self {
+            TransactionStatus::Processing(status, _) => Some(status.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the slot associated with the transaction status.
+    pub fn slot(&self) -> Slot {
+        match self {
+            TransactionStatus::Pending => 0,
+            TransactionStatus::Processing(_, slot)
+            | TransactionStatus::Committed(slot)
+            | TransactionStatus::Failed(_, _, slot) => *slot,
         }
     }
 }
@@ -133,23 +196,33 @@ impl TransactionStatus {
 impl<T> From<TransactionProgress<T>> for TransactionOutcome<T> {
     fn from(progress: TransactionProgress<T>) -> Self {
         match progress.status {
-            TransactionStatus::Pending | TransactionStatus::Processing => {
-                TransactionOutcome::Unknown(UnknownTransaction {
+            TransactionStatus::Pending => TransactionOutcome::Unsubmitted(UnsubmittedTransaction {
+                data: progress.data,
+                slot: None,
+            }),
+            TransactionStatus::Processing(status, slot) => {
+                TransactionOutcome::InFlight(InFlightTransaction {
                     data: progress.data,
+                    slot,
+                    status,
                 })
             }
-            TransactionStatus::Failed(err, logs) => {
+            TransactionStatus::Failed(error, logs, slot) => {
                 TransactionOutcome::Failure(Box::new(FailedTransaction {
                     data: progress.data,
-                    error: err.into(),
+                    error: error.to_string(),
+                    slot,
                     logs,
                 }))
             }
-            TransactionStatus::Committed => {
+            TransactionStatus::Committed(_slot) => {
+                let (slot, signature) = progress.landed_as.expect(
+                    "landed_as should be Some if status is Committed; this is a bug in BatchClient",
+                );
                 TransactionOutcome::Success(Box::new(SuccessfulTransaction {
                     data: progress.data,
-                    slot: progress.landed_as.unwrap().0,
-                    signature: progress.landed_as.unwrap().1,
+                    slot,
+                    signature,
                 }))
             }
         }

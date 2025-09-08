@@ -1,188 +1,221 @@
 use std::sync::Arc;
 
 use solana_client::{
-    client_error::ClientError as Error, rpc_client::SerializableTransaction,
+    client_error::{ClientError as Error, ClientErrorKind},
+    rpc_client::SerializableTransaction,
     rpc_config::RpcSendTransactionConfig,
 };
 use solana_commitment_config::CommitmentLevel;
 use solana_keypair::Keypair;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use solana_signature::Signature;
 use solana_transaction::Transaction;
+use solana_transaction_error::TransactionError;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{RwLock, mpsc, watch},
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{Instrument, Span, trace, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{instrument, trace, warn};
 
 use crate::{
     client::SEND_TRANSACTION_INTERVAL,
-    messages::{BlockMessage, ConfirmTransactionMessage, SendTransactionMessage},
+    messages::{BlockMessage, ConfirmTransactionMessage, SendTransactionMessage, StatusMessage},
 };
 
-/// Spawns an independent task that listens for [`SendTransactionMessage`]s and periodically submits
-/// transactions using the Solana RPC client, re-signing the transactions when necessary.
-///
-/// It does *not* check the outcome of the transaction at all other than failing if the transaction
-/// submission itself fails. When this happens, the transaction will be queued for re-sending.
-///
-/// The task will exit if there are no transaction senders alive. This will happen when the
-/// [BatchClient](`crate::batch_client::BatchClient`) has been dropped.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_transaction_sender(
+#[derive(Debug, thiserror::Error)]
+pub enum SenderError {
+    #[error("RPC error: {0}")]
+    RpcError(#[from] Box<Error>),
+    #[error("confirm channel closed")]
+    ConfirmChannelClosed,
+    #[error("send channel closed")]
+    SendChannelClosed,
+    #[error("response channel closed")]
+    ResponseChannelClosed,
+}
+
+pub type SenderResult<T = ()> = Result<T, SenderError>;
+
+impl SenderError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            SenderError::RpcError(e) => match e.kind() {
+                ClientErrorKind::SigningError(_) => true,
+                ClientErrorKind::TransactionError(transaction_error) => matches!(
+                    transaction_error,
+                    TransactionError::AccountInUse
+                        | TransactionError::BlockhashNotFound
+                        | TransactionError::ClusterMaintenance
+                        | TransactionError::CommitCancelled
+                        | TransactionError::InstructionError(..)
+                        | TransactionError::InsufficientFundsForRent { .. }
+                        | TransactionError::InvalidAccountForFee
+                        | TransactionError::InvalidLoadedAccountsDataSizeLimit
+                        | TransactionError::InvalidRentPayingAccount
+                        | TransactionError::MaxLoadedAccountsDataSizeExceeded
+                        | TransactionError::MissingSignatureForFee
+                        | TransactionError::ProgramCacheHitMaxLimit
+                        | TransactionError::ProgramExecutionTemporarilyRestricted { .. }
+                        | TransactionError::ResanitizationNeeded
+                        | TransactionError::SanitizeFailure
+                        | TransactionError::WouldExceedAccountDataBlockLimit
+                        | TransactionError::WouldExceedAccountDataTotalLimit
+                        | TransactionError::WouldExceedMaxAccountCostLimit
+                        | TransactionError::WouldExceedMaxBlockCostLimit
+                        | TransactionError::WouldExceedMaxVoteCostLimit
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Sender {
     rpc_client: Arc<RpcClient>,
     signers: Vec<Arc<Keypair>>,
     blockdata_rx: watch::Receiver<BlockMessage>,
-    transaction_confirmer_tx: mpsc::UnboundedSender<ConfirmTransactionMessage>,
-    transaction_sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
-    mut transaction_sender_rx: mpsc::UnboundedReceiver<SendTransactionMessage>,
-    mut shutdown_signal: watch::Receiver<()>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    confirmer_tx: mpsc::UnboundedSender<ConfirmTransactionMessage>,
+    sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
+    sender_rx: Arc<RwLock<mpsc::UnboundedReceiver<SendTransactionMessage>>>,
+    cancellation_token: CancellationToken,
+}
+
+impl Sender {
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        signers: Vec<Arc<Keypair>>,
+        blockdata_rx: watch::Receiver<BlockMessage>,
+        confirmer_tx: mpsc::UnboundedSender<ConfirmTransactionMessage>,
+        sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
+        sender_rx: mpsc::UnboundedReceiver<SendTransactionMessage>,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        Self {
+            rpc_client,
+            signers,
+            blockdata_rx,
+            confirmer_tx,
+            sender_tx,
+            sender_rx: Arc::new(RwLock::new(sender_rx)),
+            cancellation_token,
+        }
+    }
+
+    fn confirm_message(&self, msg: ConfirmTransactionMessage) -> SenderResult {
+        self.confirmer_tx.send(msg).map_err(|e| {
+            warn!("failed to queue transaction for confirmation: {e}");
+            SenderError::ConfirmChannelClosed
+        })
+    }
+
+    fn resend_message(&self, msg: SendTransactionMessage) -> SenderResult {
+        self.sender_tx.send(msg).map_err(|e| {
+            warn!("failed to re-queue transaction for sending: {e}");
+            SenderError::SendChannelClosed
+        })
+    }
+
+    #[instrument(skip(self, transaction), name = "send-transaction", fields(tx = %transaction.get_signature()))]
+    async fn send_transaction(&self, transaction: &Transaction) -> SenderResult {
+        self.rpc_client
+            .send_transaction_with_config(
+                transaction,
+                RpcSendTransactionConfig {
+                    max_retries: Some(0),
+                    skip_preflight: true,
+                    preflight_commitment: Some(CommitmentLevel::Processed),
+                    min_context_slot: None,
+                    encoding: None,
+                },
+            )
+            .await
+            .map_err(Box::new)?;
+
+        Ok(())
+    }
+
+    async fn handle_transaction(&self, mut msg: SendTransactionMessage) -> SenderResult {
+        let blockdata = *self.blockdata_rx.borrow();
+        let last_valid_block_height = msg.sign(&blockdata, &self.signers);
+
+        match self.send_transaction(&msg.transaction).await {
+            Ok(_) => {
+                trace!(
+                    "[{}] successfully submitted tx {} to RPC",
+                    msg.index,
+                    msg.transaction.get_signature()
+                );
+                self.confirm_message(ConfirmTransactionMessage {
+                    span: msg.span,
+                    index: msg.index,
+                    transaction: msg.transaction,
+                    last_valid_block_height,
+                    response_tx: msg.response_tx,
+                })?;
+            }
+            Err(e) => {
+                warn!(
+                    "failed to send transaction [{}] (batch index: {}, target slot: {}, current block: {}): {e:?}",
+                    msg.transaction.get_signature(),
+                    msg.index,
+                    last_valid_block_height,
+                    blockdata.block_height
+                );
+
+                if !e.is_transient() {
+                    warn!(
+                        "not retrying transaction [{}] (batch index: {}), error is not transient",
+                        msg.transaction.get_signature(),
+                        msg.index
+                    );
+                    msg.update_status(StatusMessage::from_sender_error(msg.index, e))?;
+                    return Ok(());
+                }
+
+                self.resend_message(SendTransactionMessage {
+                    // Force re-sign. Since the transaction couldn't be sent, this should be safe.
+                    last_valid_block_height: 0,
+                    ..msg
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_loop(&mut self) -> SenderResult {
         let mut last_send = Instant::now();
 
         loop {
+            let mut sender_rx = self.sender_rx.write().await;
             tokio::select! {
-                _ = shutdown_signal.changed() => {
+                _ = self.cancellation_token.cancelled() => {
                     warn!("received shutdown signal, shutting down transaction sender");
                     break;
                 }
-                _ = transaction_sender_tx.closed() => {
-                    warn!("no senders for transaction sender, shutting down transaction sender");
-                    break;
-                }
-                Some(mut msg) = transaction_sender_rx.recv() => {
-                    if msg.response_tx.is_closed() {
-                        warn!("no receivers for transaction sender, shutting down transaction sender");
-                        break;
-                    }
-                    // Get the current newest block data but don't wait for a new block, just use
-                    // the current value.
-                    let blockdata = *blockdata_rx.borrow();
-                    let last_valid_block_height =
-                        sign_transaction_if_necessary(&blockdata, &mut msg, &signers);
-
+                Some(msg) = sender_rx.recv() => {
                     // Space the transaction submissions out by a small delay to avoid rate limits.
                     tokio::time::sleep_until(last_send + SEND_TRANSACTION_INTERVAL).await;
                     last_send = Instant::now();
-
-                    let res = send_transaction(&rpc_client, &msg.transaction)
-                        .instrument(msg.span.clone())
-                        .await;
-
-                    match res {
-                        Ok(_) => {
-                            trace!(
-                                "[{}] successfully submitted tx {} to RPC",
-                                msg.index,
-                                msg.transaction.get_signature()
-                            );
-                            if let Err(e) = transaction_confirmer_tx.send(ConfirmTransactionMessage {
-                                span: msg.span,
-                                index: msg.index,
-                                transaction: msg.transaction,
-                                last_valid_block_height,
-                                response_tx: msg.response_tx,
-                            }) {
-                                warn!("failed to queue transaction for confirmation: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            let _enter = msg.span.clone().entered();
-                            warn!(
-                                "failed to send transaction [{}] (batch index: {}, target slot: {}, current block: {}): {e:?}",
-                                msg.transaction.get_signature(),
-                                msg.index,
-                                last_valid_block_height,
-                                blockdata.block_height
-                            );
-
-                            if let Err(e) = transaction_sender_tx.send(SendTransactionMessage {
-                                // Force re-sign. Since the transaction couldn't be sent, this should be safe.
-                                last_valid_block_height: 0,
-                                ..msg
-                            }) {
-                                warn!("failed to re-queue transaction for sending: {e}");
-                                break;
-                            }
-                        }
-                    }
+                    self.handle_transaction(msg).await?;
                 }
             }
         }
 
         warn!("shutting down transaction sender");
-    })
-}
-
-/// Signs a transaction if necessary. If the transaction's last valid block height has expired,
-/// or if it has been explicitly set to 0, forcing a re-sign.
-///
-/// If the transaction does not need to be re-signed, it is returned as-is.
-///
-/// # Returns
-/// The last valid block height of the transaction, whether changed or not.
-fn sign_transaction_if_necessary(
-    blockdata: &BlockMessage,
-    msg: &mut SendTransactionMessage,
-    signers: &Vec<Arc<Keypair>>,
-) -> u64 {
-    let _enter = msg.span.clone().entered();
-    if blockdata.block_height > msg.last_valid_block_height + 1 {
-        let old_sig = *msg.transaction.get_signature();
-        msg.transaction.sign(signers, blockdata.blockhash);
-        if old_sig != Signature::default() {
-            trace!(
-                "[{}] re-sending tx {} as {}",
-                msg.index,
-                old_sig,
-                msg.transaction.get_signature()
-            );
-        }
-        blockdata.last_valid_block_height
-    } else {
-        trace!(
-            "[{}] sending tx {}",
-            msg.index,
-            msg.transaction.get_signature()
-        );
-        msg.last_valid_block_height
+        Ok(())
     }
-}
 
-/// Submits a transaction using the [`TpuClient`] if one is provided, otherwise using the
-/// [`RpcClient`].
-///
-/// Returns an error if the transaction submission itself fails - the outcome of the transaction
-/// is not checked.
-async fn send_transaction(
-    rpc_client: &Arc<RpcClient>,
-    transaction: &Transaction,
-) -> Result<(), Error> {
-    let rpc_client = rpc_client.clone();
-    let transaction = transaction.clone();
-    let span = Span::current();
-    tokio::spawn(async move {
-        let res = rpc_client
-            .send_transaction_with_config(
-                &transaction,
-                RpcSendTransactionConfig {
-                    max_retries: Some(0),
-                    skip_preflight: true,
-                    preflight_commitment: Some(CommitmentLevel::Processed),
-                    ..Default::default()
-                },
-            )
-            .instrument(span.clone())
-            .await;
-        // Log errors but don't act on them, they will be caught later and retried regardless.
-        if let Err(e) = res {
-            warn!(parent: &span, "Error sending transaction: {:?}", e);
-        }
-    });
-
-    Ok(())
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.send_loop().await {
+                warn!("transaction sender exited with error: {e}");
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -222,16 +255,17 @@ mod tests {
         let (transaction_sender_tx, transaction_sender_rx) =
             mpsc::unbounded_channel::<SendTransactionMessage>();
 
-        let (shutdown_signal_tx, shutdown_signal_rx) = watch::channel(());
-        let handle = spawn_transaction_sender(
-            rpc_client,
+        let cancellation_token = CancellationToken::new();
+        let sender = Sender::new(
+            rpc_client.clone(),
             vec![payer.clone()],
             blockdata_rx,
             transaction_confirmer_tx,
             transaction_sender_tx.clone(),
             transaction_sender_rx,
-            shutdown_signal_rx,
+            cancellation_token.clone(),
         );
+        let handle = sender.spawn();
 
         // No transactions should be queued for confirmation yet.
         transaction_confirmer_rx.try_recv().unwrap_err();
@@ -305,7 +339,7 @@ mod tests {
         // Drop the transaction sender and response receiver to trigger the watcher to exit.
         drop(transaction_sender_tx);
         drop(response_rx);
-        drop(shutdown_signal_tx);
+        cancellation_token.cancel();
         handle.await.unwrap();
     }
 }
