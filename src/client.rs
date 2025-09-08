@@ -22,7 +22,7 @@ use crate::{
     tasks::{
         block_watcher::BlockWatcher,
         transaction_confirmer::{ConfirmError, Confirmer},
-        transaction_sender::{Sender, SenderError},
+        transaction_sender::{Sender, SenderError, is_transient_transaction_error},
     },
     transaction::TransactionStatus,
 };
@@ -44,6 +44,15 @@ impl PartialEq for NitroSenderError {
 }
 
 impl Eq for NitroSenderError {}
+
+impl NitroSenderError {
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Tx(transaction_error) => is_transient_transaction_error(transaction_error),
+            _ => false,
+        }
+    }
+}
 
 /// Send at ~333 TPS
 pub const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(1);
@@ -176,7 +185,7 @@ pub async fn wait_for_responses<T>(
             break;
         }
 
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(num_messages);
         match timeout_at(deadline, response_rx.recv_many(&mut buffer, num_messages)).await {
             Ok(0) => {
                 // If this is ever zero, that means the channel was closed.

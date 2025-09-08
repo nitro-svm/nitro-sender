@@ -37,34 +37,40 @@ pub enum SenderError {
 
 pub type SenderResult<T = ()> = Result<T, SenderError>;
 
+pub fn is_transient_transaction_error(error: &TransactionError) -> bool {
+    matches!(
+        error,
+        TransactionError::AccountInUse
+            | TransactionError::BlockhashNotFound
+            | TransactionError::ClusterMaintenance
+            | TransactionError::CommitCancelled
+            | TransactionError::InstructionError(..)
+            | TransactionError::InsufficientFundsForRent { .. }
+            | TransactionError::InvalidAccountForFee
+            | TransactionError::InvalidLoadedAccountsDataSizeLimit
+            | TransactionError::InvalidRentPayingAccount
+            | TransactionError::MaxLoadedAccountsDataSizeExceeded
+            | TransactionError::MissingSignatureForFee
+            | TransactionError::ProgramCacheHitMaxLimit
+            | TransactionError::ProgramExecutionTemporarilyRestricted { .. }
+            | TransactionError::ResanitizationNeeded
+            | TransactionError::SanitizeFailure
+            | TransactionError::WouldExceedAccountDataBlockLimit
+            | TransactionError::WouldExceedAccountDataTotalLimit
+            | TransactionError::WouldExceedMaxAccountCostLimit
+            | TransactionError::WouldExceedMaxBlockCostLimit
+            | TransactionError::WouldExceedMaxVoteCostLimit
+    )
+}
+
 impl SenderError {
     pub fn is_transient(&self) -> bool {
         match self {
             SenderError::RpcError(e) => match e.kind() {
+                ClientErrorKind::TransactionError(transaction_error) => {
+                    is_transient_transaction_error(transaction_error)
+                }
                 ClientErrorKind::SigningError(_) => true,
-                ClientErrorKind::TransactionError(transaction_error) => matches!(
-                    transaction_error,
-                    TransactionError::AccountInUse
-                        | TransactionError::BlockhashNotFound
-                        | TransactionError::ClusterMaintenance
-                        | TransactionError::CommitCancelled
-                        | TransactionError::InstructionError(..)
-                        | TransactionError::InsufficientFundsForRent { .. }
-                        | TransactionError::InvalidAccountForFee
-                        | TransactionError::InvalidLoadedAccountsDataSizeLimit
-                        | TransactionError::InvalidRentPayingAccount
-                        | TransactionError::MaxLoadedAccountsDataSizeExceeded
-                        | TransactionError::MissingSignatureForFee
-                        | TransactionError::ProgramCacheHitMaxLimit
-                        | TransactionError::ProgramExecutionTemporarilyRestricted { .. }
-                        | TransactionError::ResanitizationNeeded
-                        | TransactionError::SanitizeFailure
-                        | TransactionError::WouldExceedAccountDataBlockLimit
-                        | TransactionError::WouldExceedAccountDataTotalLimit
-                        | TransactionError::WouldExceedMaxAccountCostLimit
-                        | TransactionError::WouldExceedMaxBlockCostLimit
-                        | TransactionError::WouldExceedMaxVoteCostLimit
-                ),
                 _ => false,
             },
             _ => false,

@@ -43,6 +43,17 @@ pub struct InFlightTransaction<T> {
     pub data: T,
     pub slot: Slot,
     pub status: TransactionConfirmationStatus,
+    pub signature: Signature,
+}
+
+impl<T> From<InFlightTransaction<T>> for SuccessfulTransaction<T> {
+    fn from(in_flight: InFlightTransaction<T>) -> Self {
+        Self {
+            data: in_flight.data,
+            slot: in_flight.slot,
+            signature: in_flight.signature,
+        }
+    }
 }
 
 /// A transaction that resulted in an error.
@@ -73,9 +84,23 @@ impl<T> TransactionOutcome<T> {
     }
 
     /// Returns [`Option::Some`] if the outcome was successful, or [`Option::None`] otherwise.
-    pub fn into_successful(self) -> Option<Box<SuccessfulTransaction<T>>> {
+    pub fn into_successful(
+        self,
+        commitment: CommitmentConfig,
+    ) -> Option<Box<SuccessfulTransaction<T>>> {
         match self {
             TransactionOutcome::Success(s) => Some(s),
+            TransactionOutcome::InFlight(in_flight) => {
+                if commitment.is_finalized() {
+                    (in_flight.status == TransactionConfirmationStatus::Finalized)
+                        .then_some(Box::new(in_flight.into()))
+                } else if commitment.is_confirmed() {
+                    (in_flight.status != TransactionConfirmationStatus::Processed)
+                        .then_some(Box::new(in_flight.into()))
+                } else {
+                    Some(Box::new(in_flight.into()))
+                }
+            }
             _ => None,
         }
     }
@@ -152,7 +177,7 @@ impl TransactionStatus {
                 } else if commitment.is_confirmed() {
                     *status == TransactionConfirmationStatus::Processed
                 } else {
-                    true
+                    false
                 }
             }
         }
@@ -160,10 +185,7 @@ impl TransactionStatus {
 
     /// Checks whether the transactions should be resent based on its status.
     pub fn should_be_resent(&self) -> bool {
-        !matches!(
-            self.error(),
-            None | Some(NitroSenderError::Tx(TransactionError::AlreadyProcessed))
-        )
+        self.error().map(|e| e.is_transient()).unwrap_or(false)
     }
 
     /// Returns the error if the transaction failed, or [`None`] otherwise.
@@ -201,10 +223,14 @@ impl<T> From<TransactionProgress<T>> for TransactionOutcome<T> {
                 slot: None,
             }),
             TransactionStatus::Processing(status, slot) => {
+                let (_slot, signature) = progress.landed_as.expect(
+                    "landed_as should be Some if status is Processing; this is a bug in BatchClient",
+                );
                 TransactionOutcome::InFlight(InFlightTransaction {
                     data: progress.data,
                     slot,
                     status,
+                    signature,
                 })
             }
             TransactionStatus::Failed(error, logs, slot) => {
