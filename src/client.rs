@@ -5,21 +5,45 @@ use solana_client::{client_error::ClientError as Error, nonblocking::rpc_client:
 use solana_keypair::Keypair;
 use solana_program::message::Message;
 use solana_transaction::Transaction;
+use solana_transaction_error::TransactionError;
 use tokio::{
     sync::mpsc,
     time::{Duration, Instant, sleep, timeout_at},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{Span, info, warn};
 
 use super::{
     channels::Channels,
     messages::{self, SendTransactionMessage, StatusMessage},
-    tasks::{
-        block_watcher::spawn_block_watcher, transaction_confirmer::spawn_transaction_confirmer,
-        transaction_sender::spawn_transaction_sender,
-    },
-    transaction::{TransactionOutcome, TransactionProgress, TransactionStatus},
+    transaction::{TransactionOutcome, TransactionProgress},
 };
+use crate::{
+    tasks::{
+        block_watcher::BlockWatcher,
+        transaction_confirmer::{ConfirmError, Confirmer},
+        transaction_sender::{Sender, SenderError},
+    },
+    transaction::TransactionStatus,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum NitroSenderError {
+    #[error("Sender error: {0}")]
+    Sender(#[from] SenderError),
+    #[error("Confirm error: {0}")]
+    Confirmer(#[from] ConfirmError),
+    #[error("TX error: {0}")]
+    Tx(#[from] TransactionError),
+}
+
+impl PartialEq for NitroSenderError {
+    fn eq(&self, other: &Self) -> bool {
+        format!("{self}") == format!("{other}")
+    }
+}
+
+impl Eq for NitroSenderError {}
 
 /// Send at ~333 TPS
 pub const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(1);
@@ -27,6 +51,7 @@ pub const SEND_TRANSACTION_INTERVAL: Duration = Duration::from_millis(1);
 /// A client that wraps an [`RpcClient`] and uses it to submit batches of transactions.
 pub struct NitroSender {
     transaction_sender_tx: mpsc::UnboundedSender<SendTransactionMessage>,
+    block_watcher: Arc<BlockWatcher>,
 }
 
 // Clone can't be derived because of the phantom references to the TPU implementation details.
@@ -34,6 +59,7 @@ impl Clone for NitroSender {
     fn clone(&self) -> Self {
         Self {
             transaction_sender_tx: self.transaction_sender_tx.clone(),
+            block_watcher: self.block_watcher.clone(),
         }
     }
 }
@@ -43,43 +69,42 @@ impl NitroSender {
     /// tasks will run until the [`BatchClient`] is dropped.
     pub async fn new(
         rpc_client: Arc<RpcClient>,
-        shutdown_signal_rx: tokio::sync::watch::Receiver<()>,
+        cancellation_token: CancellationToken,
         signers: Vec<Arc<Keypair>>,
     ) -> Result<Self, Error> {
         let Channels {
-            blockdata_tx,
-            mut blockdata_rx,
-            transaction_confirmer_tx,
-            transaction_confirmer_rx,
             transaction_sender_tx,
             transaction_sender_rx,
         } = Channels::new();
 
-        spawn_block_watcher(blockdata_tx, shutdown_signal_rx.clone(), rpc_client.clone());
+        let (block_watcher, mut blockdata_rx) =
+            BlockWatcher::new(rpc_client.clone(), cancellation_token.clone());
+        block_watcher.spawn();
         // Wait for the first update so the default value is never visible.
         let _ = blockdata_rx.changed().await;
 
-        spawn_transaction_confirmer(
+        let (confirmer, transaction_confirmer_tx) = Confirmer::new(
             rpc_client.clone(),
             blockdata_rx.clone(),
             transaction_sender_tx.clone(),
-            transaction_confirmer_tx.clone(),
-            transaction_confirmer_rx,
-            shutdown_signal_rx.clone(),
+            cancellation_token.clone(),
         );
+        confirmer.spawn();
 
-        spawn_transaction_sender(
+        let sender = Sender::new(
             rpc_client.clone(),
             signers.clone(),
             blockdata_rx.clone(),
             transaction_confirmer_tx.clone(),
             transaction_sender_tx.clone(),
             transaction_sender_rx,
-            shutdown_signal_rx,
+            cancellation_token,
         );
+        sender.spawn();
 
         Ok(Self {
             transaction_sender_tx,
+            block_watcher,
         })
     }
 
@@ -181,7 +206,7 @@ pub async fn wait_for_responses<T>(
         }
     }
 
-    progress.into_iter().map(Into::into).collect()
+    progress.into_iter().map_into().collect()
 }
 
 /// Converts an optional timeout to a conditionless deadline.
@@ -199,8 +224,8 @@ fn log_progress_bar<T>(progress: &[TransactionProgress<T>]) {
         .iter()
         .map(|progress| match progress.status {
             TransactionStatus::Pending => ' ',
-            TransactionStatus::Processing => '.',
-            TransactionStatus::Committed => 'x',
+            TransactionStatus::Processing(..) => '.',
+            TransactionStatus::Committed(_) => 'x',
             TransactionStatus::Failed(..) => '!',
         })
         .join("");

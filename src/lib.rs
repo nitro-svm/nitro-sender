@@ -8,5 +8,6 @@ mod transaction;
 
 pub use client::NitroSender;
 pub use transaction::{
-    FailedTransaction, SuccessfulTransaction, TransactionOutcome, UnknownTransaction,
+    FailedTransaction, InFlightTransaction, SuccessfulTransaction, TransactionOutcome,
+    UnsubmittedTransaction,
 };

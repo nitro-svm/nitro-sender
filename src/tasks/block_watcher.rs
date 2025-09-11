@@ -1,76 +1,105 @@
 use std::sync::Arc;
 
+use solana_epoch_info::EpochInfo;
 use solana_program::clock::DEFAULT_MS_PER_SLOT;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use tokio::{sync::watch, task::JoinHandle, time::Duration};
-use tracing::{info, warn};
+use tokio::{
+    sync::{RwLock, watch},
+    task::JoinHandle,
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{info, instrument, warn};
 
 use crate::messages::BlockMessage;
 
-async fn get_block_info(client: &RpcClient) -> Option<BlockMessage> {
-    let (blockhash, last_valid_block_height) = client
-        .get_latest_blockhash_with_commitment(client.commitment())
-        .await
-        .inspect_err(|e| {
-            warn!("failed to get latest blockhash: {e}");
-        })
-        .ok()?;
-
-    let epoch_info = client
-        .get_epoch_info_with_commitment(client.commitment())
-        .await
-        .inspect_err(|e| {
-            warn!("failed to get epoch info: {e}");
-        })
-        .ok()?;
-
-    Some(BlockMessage {
-        blockhash,
-        last_valid_block_height,
-        block_height: epoch_info.block_height,
-    })
+/// Watches the Solana blockchain for new blocks and broadcasts updates via a channel.
+#[derive(Clone)]
+pub struct BlockWatcher {
+    block_message_tx: watch::Sender<BlockMessage>,
+    rpc_client: Arc<RpcClient>,
+    head: Arc<RwLock<BlockMessage>>,
+    cancellation_token: CancellationToken,
 }
 
-/// Spawns an independent task that periodically checks the latest blockhash and epoch info using
-/// the Solana RPC client, and broadcasts it as a [`BlockMessage`] on the given channel.
-///
-/// The task will exit if there are no receivers alive. This will happen when the
-/// [transaction confirmer](`super::transaction_confirmer::spawn_transaction_confirmer`) and
-/// [transaction sender](`super::transaction_sender::spawn_transaction_sender`) tasks have both exited.
-pub fn spawn_block_watcher(
-    blockdata_tx: watch::Sender<BlockMessage>,
-    shutdown_signal: watch::Receiver<()>,
-    rpc_client: Arc<RpcClient>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+impl BlockWatcher {
+    /// Creates a new [`BlockWatcher`] instance along with a [`watch::Receiver`] to receive
+    /// [`BlockMessage`] updates.
+    pub fn new(
+        rpc_client: Arc<RpcClient>,
+        cancellation_token: CancellationToken,
+    ) -> (Arc<Self>, watch::Receiver<BlockMessage>) {
+        let head = BlockMessage::default();
+        let (block_message_tx, mut block_message_rx) = watch::channel(head);
+        block_message_rx.mark_unchanged();
+        (
+            Arc::new(Self {
+                block_message_tx,
+                rpc_client,
+                head: Arc::new(RwLock::new(head)),
+                cancellation_token,
+            }),
+            block_message_rx,
+        )
+    }
+
+    /// Gets the latest block information from the RPC client.
+    async fn get_block_info(&self) -> Option<BlockMessage> {
+        let (blockhash, last_valid_block_height) = self
+            .rpc_client
+            .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+            .await
+            .inspect_err(|e| {
+                warn!("failed to get latest blockhash: {e}");
+            })
+            .ok()?;
+
+        let EpochInfo { block_height, .. } = self
+            .rpc_client
+            .get_epoch_info_with_commitment(self.rpc_client.commitment())
+            .await
+            .inspect_err(|e| {
+                warn!("failed to get epoch info: {e}");
+            })
+            .ok()?;
+
+        Some(BlockMessage {
+            blockhash,
+            last_valid_block_height,
+            block_height,
+        })
+    }
+
+    #[instrument(skip(self), name = "[block-watcher]")]
+    pub async fn update_loop(&self) {
         // This will never equal the new slot, so the first update is always broadcast.
-        let mut last_update = BlockMessage::default();
         let mut ticker = tokio::time::interval(Duration::from_millis(DEFAULT_MS_PER_SLOT));
-        let mut shutdown_signal = shutdown_signal;
 
         loop {
             tokio::select! {
-                _ = shutdown_signal.changed() => {
+                _ = self.cancellation_token.cancelled() => {
                     // If we received a shutdown signal, exit the loop.
                     info!("received shutdown signal, exiting block watcher");
                     break;
                 }
-                _ = blockdata_tx.closed() => {
+                _ = self.block_message_tx.closed() => {
                     // If the channel is closed, exit the loop.
                     break;
                 }
                 _ = ticker.tick() => {
-                    let Some(new_update) = get_block_info(&rpc_client).await else {
-                        // If we failed to get the block info, just try again on the next tick.
+                    let Some(new_update) = self.get_block_info().await else {
+                        warn!("failed to get block info, retrying");
                         continue;
                     };
 
-                    if new_update == last_update {
+                    if new_update == *self.head.read().await {
+                        warn!("skipping duplicate block update: {new_update:?}");
                         continue;
                     }
 
-                    last_update = new_update;
-                    if let Err(e) = blockdata_tx.send(new_update) {
+                    self.head.write().await.clone_from(&new_update);
+
+                    if let Err(e) = self.block_message_tx.send(new_update) {
                         warn!("failed to send block update: {e}");
                         break;
                     }
@@ -79,7 +108,16 @@ pub fn spawn_block_watcher(
         }
 
         warn!("shutting down block watcher");
-    })
+    }
+
+    /// Spawns an independent task that periodically checks the latest blockhash and epoch info using
+    /// the Solana RPC client, and broadcasts it as a [`BlockMessage`] on the given channel.
+    pub fn spawn(self: &Arc<Self>) -> JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.update_loop().await;
+        })
+    }
 }
 
 #[cfg(test)]
@@ -113,13 +151,6 @@ mod tests {
         // on the current time.
         let initial_time = Instant::now();
 
-        // Dummy initial value to distinguish it from what the MockBlockSender returns.
-        let initial_value = BlockMessage {
-            blockhash: Hash::default(),
-            last_valid_block_height: 1234,
-            block_height: 5678,
-        };
-        let (tx, mut rx) = watch::channel(initial_value);
         let client = Arc::new(RpcClient::new_sender(
             // This sender is implemented below.
             MockBlockSender {
@@ -129,11 +160,9 @@ mod tests {
             },
             RpcClientConfig::default(),
         ));
-        let (_shutdown_tx, shutdown_rx) = watch::channel(());
-        let handle = spawn_block_watcher(tx, shutdown_rx, client);
-
-        // Checking the value straight away should return the initial value.
-        assert_eq!(*rx.borrow_and_update(), initial_value);
+        let cancellation_token = CancellationToken::new();
+        let (block_watcher, mut rx) = BlockWatcher::new(client.clone(), cancellation_token.clone());
+        let handle = block_watcher.spawn();
 
         // Checking the value half a slot later should give a new value.
         tokio::time::sleep_until(initial_time + Duration::from_millis(DEFAULT_MS_PER_SLOT / 2))
