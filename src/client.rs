@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use solana_client::{client_error::ClientError as Error, nonblocking::rpc_client::RpcClient};
+use solana_commitment_config::CommitmentConfig;
 use solana_keypair::Keypair;
 use solana_program::message::Message;
 use solana_transaction::Transaction;
@@ -77,7 +78,7 @@ impl NitroSender {
     /// Creates a new [`BatchClient`], and spawns the associated background tasks. The background
     /// tasks will run until the [`BatchClient`] is dropped.
     pub async fn new(
-        rpc_client: Arc<RpcClient>,
+        rpc_url: String,
         cancellation_token: CancellationToken,
         signers: Vec<Arc<Keypair>>,
     ) -> Result<Self, Error> {
@@ -85,6 +86,11 @@ impl NitroSender {
             transaction_sender_tx,
             transaction_sender_rx,
         } = Channels::new();
+
+        let rpc_client = Arc::new(RpcClient::new_with_commitment(
+            rpc_url,
+            CommitmentConfig::confirmed(),
+        ));
 
         let (block_watcher, mut blockdata_rx) =
             BlockWatcher::new(rpc_client.clone(), cancellation_token.clone());
