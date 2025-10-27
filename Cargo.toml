@@ -22,7 +22,7 @@ tracing = { version = "0.1.41", default-features = false, features = [
 ] }
 
 # Solana & Agave
-solana-client = "2.2.1"
+solana-client = "3.0.8"
 solana-commitment-config = "2.2.1"
 solana-epoch-info = "2.2.1"
 solana-keypair = "2.2.1"
