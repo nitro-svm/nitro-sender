@@ -16,7 +16,7 @@ itertools = "0.14.0"
 serde_json = { version = "1.0.143", default-features = false }
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
-tokio-util = "0.7.16"
+tokio-util = "0.7.17"
 tracing = { version = "0.1.41", default-features = false, features = [
   "attributes",
 ] }
